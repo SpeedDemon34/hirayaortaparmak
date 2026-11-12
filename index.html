@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Sana bir hediyem var 🎁</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:manipulation}
+  canvas{display:block;width:100vw;height:100vh;cursor:pointer}
+  #hint{position:fixed;left:0;right:0;bottom:7vh;text-align:center;color:#aaa;font:14px monospace;animation:b 1.6s infinite;pointer-events:none}
+  @keyframes b{50%{opacity:.25}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">açmak için dokun 🎁</div>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const hint = document.getElementById('hint');
+
+const RAMP = '.,-~:;=!*#$@';
+// materyaller: kutu, kurdele, fiyonk, taç yaprak, çiçek göbeği, sap, kıvılcım
+const MAT = [[230,60,50],[245,190,90],[255,225,190],[255,255,255],[255,160,40],[90,200,90],[255,255,255],[235,170,130],[255,220,215]];
+const LV = 16;
+const PAL = MAT.map(c => Array.from({length: LV}, (_, i) => {
+  const k = 0.25 + 0.75 * i / (LV - 1);
+  return `rgb(${c[0]*k|0},${c[1]*k|0},${c[2]*k|0})`;
+}));
+
+let W, H, cw, ch, cols, rows, zb, lb, mb, stars;
+function resize() {
+  const dpr = devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const fs = Math.max(7, Math.min(W, H) / 75);
+  ctx.font = `bold ${fs}px monospace`;
+  cw = ctx.measureText('M').width; ch = fs * 1.15;
+  cols = Math.ceil(W / cw); rows = Math.ceil(H / ch);
+  zb = new Float32Array(cols * rows); lb = new Uint8Array(cols * rows); mb = new Int8Array(cols * rows);
+  stars = Array.from({length: (cols * rows / 60) | 0}, () => [Math.random() * cols | 0, Math.random() * rows | 0, Math.random() * 6]);
+}
+addEventListener('resize', resize); resize();
+
+// ---------- geometri: nokta = [x,y,z,nx,ny,nz,mat]
+const S = 0.045, BOT = -1.6, TOP = 0.4, HW = 1;
+function wall(n) { // n: 0..3 yan duvarlar; yerel koordinat (u: yatay, h: yükseklik)
+  const pts = [];
+  for (let u = -HW; u <= HW; u += S) for (let h = 0; h <= TOP - BOT; h += S)
+    pts.push([u, h, Math.abs(u) < 0.16 ? 1 : 0]);
+  return pts;
+}
+const WALL = wall();
+const BASE = [];
+for (let x = -HW; x <= HW; x += S) for (let z = -HW; z <= HW; z += S) BASE.push([x, BOT, z, 0, -1, 0, Math.abs(x) < .16 || Math.abs(z) < .16 ? 1 : 0]);
+
+const LID = [], LW = 1.1, LT = TOP, LH = 0.35;
+for (let x = -LW; x <= LW; x += S) for (let z = -LW; z <= LW; z += S)
+  LID.push([x, LT + LH, z, 0, 1, 0, Math.abs(x) < .16 || Math.abs(z) < .16 ? 1 : 0]);
+for (let u = -LW; u <= LW; u += S) for (let h = 0; h <= LH; h += S) {
+  const r = Math.abs(u) < .16 ? 1 : 0, y = LT + h;
+  LID.push([u, y, LW, 0, 0, 1, r], [u, y, -LW, 0, 0, -1, r], [LW, y, u, 1, 0, 0, r], [-LW, y, u, -1, 0, 0, r]);
+}
+// fiyonk: iki halka + düğüm
+for (const sd of [-1, 1]) for (let t = 0; t < Math.PI * 2; t += 0.05) for (let p = 0; p < Math.PI * 2; p += 0.5) {
+  const cx = sd * (0.45 - 0.45 * Math.cos(t)), cy = 0.42 * Math.sin(t) * (1 - 0.3 * Math.cos(t)) + 0.35;
+  const nx = Math.cos(p), nz = Math.sin(p);
+  LID.push([cx,LT + LH + cy + 0.3 + nx * 0.09, nz * 0.13, nx * .3 * sd, nx, nz, 2]);
+}
+for (let t = 0; t < Math.PI * 2; t += 0.3) for (let p = 0; p < Math.PI; p += 0.3)
+  LID.push([0.15 * Math.sin(p) * Math.cos(t), LT + LH + 0.3 + 0.15 * Math.cos(p), 0.15 * Math.sin(p) * Math.sin(t), Math.sin(p) * Math.cos(t), Math.cos(p), Math.sin(p) * Math.sin(t), 2]);
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+// el: orta parmak (yerel koordinat, bilek altta, elin sırtı kameraya bakar)
+const SKIN = 7, NAIL = 8;
+const HAND = [];
+function capsule(ax, ay, az, bx, by, bz, r, m, st = 0.035) {
+  const dx = bx - ax, dy = by - ay, dz = bz - az, len = Math.hypot(dx, dy, dz);
+  const wx = dx / len, wy = dy / len, wz = dz / len;
+  let ux = -wy, uy = wx, uz = 0; if (Math.abs(wz) > 0.9) { ux = 1; uy = 0; uz = 0; }
+  const ul = Math.hypot(ux, uy, uz); ux /= ul; uy /= ul; uz /= ul;
+  const vx = wy * uz - wz * uy, vy = wz * ux - wx * uz, vz = wx * uy - wy * ux;
+  const na = Math.max(12, Math.ceil(2 * Math.PI * r / st));
+  for (let s = -r; s <= len + r; s += st) {
+    const t = Math.min(len, Math.max(0, s)), e = s - t; // e: uç kapak
+    const rr = Math.sqrt(Math.max(0, r * r - e * e));
+    const cx = ax + wx * t, cy = ay + wy * t, cz = az + wz * t;
+    for (let i = 0; i < na; i++) {
+      const a = i / na * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+      const ox = (ux * ca + vx * sa) * rr + wx * e, oy = (uy * ca + vy * sa) * rr + wy * e, oz = (uz * ca + vz * sa) * rr + wz * e;
+      HAND.push([cx + ox, cy + oy, cz + oz, ox / r, oy / r, oz / r, m]);
+    }
+  }
+}
+// avuç: yuvarlatılmış kutu (yassı elipsoid)
+for (let a = 0; a < Math.PI * 2; a += 0.05) for (let b = -Math.PI / 2; b <= Math.PI / 2; b += 0.05) {
+  const cb = Math.cos(b), x = Math.sign(Math.cos(a) * cb) * Math.pow(Math.abs(Math.cos(a) * cb), 0.5) * 0.62,
+        y = Math.sign(Math.sin(b)) * Math.pow(Math.abs(Math.sin(b)), 0.5) * 0.6,
+        z = Math.sign(Math.sin(a) * cb) * Math.pow(Math.abs(Math.sin(a) * cb), 0.6) * 0.3;
+  HAND.push([x, y, z + 0.05, Math.cos(a) * cb, Math.sin(b), Math.sin(a) * cb, SKIN]);
+}
+// orta parmak
+capsule(0, 0.45, 0.02, 0, 1.25, 0, 0.16, SKIN);
+capsule(0, 1.25, 0, 0, 1.85, -0.03, 0.145, SKIN);
+// tırnak (kameraya bakan uç)
+for (let y = 1.6; y <= 1.9; y += 0.025) for (let x = -0.1; x <= 0.1; x += 0.025)
+  HAND.push([x, y, -0.03 - 0.15 - (0.01 - x * x) * 0.6, 0, 0, -1, NAIL]);
+// bükülü parmaklar (boğumlar öne doğru)
+for (const [x, r] of [[-0.42, 0.14], [0.36, 0.14], [0.6, 0.12]]) {
+  capsule(x, 0.5, 0.02, x, 0.68, -0.12, r, SKIN);
+  capsule(x, 0.68, -0.12, x * 0.95, 0.42, -0.32, r, SKIN);
+  capsule(x * 0.95, 0.42, -0.32, x * 0.9, 0.12, -0.28, r * 0.95, SKIN);
+}
+// başparmak
+capsule(-0.62, -0.1, -0.05, -0.55, 0.2, -0.32, 0.15, SKIN);
+capsule(-0.55, 0.2, -0.32, -0.2, 0.25, -0.38, 0.13, SKIN);
+// bilek / kol
+capsule(0, -0.5, 0.05, 0, -3.2, 0.1, 0.38, SKIN, 0.045);
+for (const p of HAND) { p[0] *= 1.5; p[1] *= 1.5; p[2] *= 1.5; }
+
+
+// ---------- render
+const L = (() => { const l = [-0.4, 0.7, 0.6], n = Math.hypot(...l); return l.map(v => v / n); })();
+let cy, sy, cx, sx, K, D = 7;
+function plot(x, y, z, nx, ny, nz, m) {
+  // Y etrafında dön, sonra X eğimi
+  let X = x * cy + z * sy, Z = -x * sy + z * cy;
+  let Y = y * cx - Z * sx; Z = y * sx + Z * cx;
+  let NX = nx * cy + nz * sy, NZ = -nx * sy + nz * cy;
+  let NY = ny * cx - NZ * sx; NZ = ny * sx + NZ * cx;
+  const iz = 1 / (D + Z);
+  const c = (W / 2 + K * X * iz) / cw | 0, r = (H * 0.47 - K * (Y - 0.6) * iz) / ch | 0;
+  if (c < 0 || r < 0 || c >= cols || r >= rows) return;
+  const i = r * cols + c;
+  if (iz <= zb[i]) return;
+  zb[i] = iz;
+  let d = NX * L[0] + NY * L[1] - NZ * L[2]; if (d < 0) d = -d * 0.8;
+  if (m === 3 || m === NAIL) d = 0.6 + d * 0.4;
+  lb[i] = Math.min(LV - 1, (0.4 + 0.6 * d) * (LV - 1) | 0); mb[i] = m;
+}
+
+const WALLS = [[0, 1], [0, -1], [1, 0], [-1, 0]]; // dış normaller (x,z)
+let opened = false, t0 = 0, sparks = [];
+function open() {
+  if (opened) { opened = false; hint.style.display = ''; return; }
+  opened = true; t0 = performance.now(); hint.style.display = 'none';
+  sparks = Array.from({length: 260}, () => {
+    const a = Math.random() * 6.28, e = rnd(0.2, 1.3), v = rnd(1.5, 4);
+    return [0, TOP, 0, Math.cos(a) * Math.cos(e) * v, Math.sin(e) * v, Math.sin(a) * Math.cos(e) * v];
+  });
+}
+cv.addEventListener('pointerdown', open);
+addEventListener('keydown', e => (e.key === ' ' || e.key === 'Enter') && open());
+
+const ease = x => x <= 0 ? 0 : x >= 1 ? 1 : 1 - Math.pow(1 - x, 3);
+function frame(now) {
+  const T = now / 1000, t = opened ? (now - t0) / 1000 : -1;
+  zb.fill(0); mb.fill(-1);
+  K = Math.min(W * 1.2, H * 0.7);
+  const ay = Math.sin(T * 0.5) * 0.35, ax = -0.38;
+  cy = Math.cos(ay); sy = Math.sin(ay); cx = Math.cos(ax); sx = Math.sin(ax);
+
+  // kutu kapalıyken hafif zıplama
+  const bob = opened ? 0 : Math.abs(Math.sin(T * 2.5)) * 0.12;
+  const shake = !opened ? 0 : t < 0.5 ? Math.sin(t * 60) * 0.04 * (1 - t / .5) : 0;
+
+  for (const p of BASE) plot(p[0] + shake, p[1] + bob, p[2], p[3], p[4], p[5], p[6]);
+  const wa = ease((t - 0.9) / 0.9) * Math.PI / 2 * 0.85; // duvar açılma açısı
+  const ca = Math.cos(wa), sa = Math.sin(wa);
+  for (const [nx, nz] of WALLS) {
+    const tx = -nz, tz = nx; // duvar boyunca teğet
+    for (const [u, h, m] of WALL) {
+      const hx = nx * HW + tx * u, hz = nz * HW + tz * u;
+      plot(hx + nx * h * sa + shake, BOT + h * ca + bob, hz + nz * h * sa, nx * ca, -sa, nz * ca, m);
+    }
+  }
+  // kapak: yukarı fırlar, döner, kaybolur
+  if (t < 2.2) {
+    const lt = Math.max(0, t - 0.5), up = opened ? lt * 3 + lt * lt * 4 : 0, sp = opened ? lt * 5 : 0;
+    const cs = Math.cos(sp), sn = Math.sin(sp);
+    for (const p of LID) {
+      const x = p[0] * cs - (p[1] - TOP) * sn, y = p[0] * sn + (p[1] - TOP) * cs;
+      plot(x + shake, y + TOP + up + bob, p[2], p[3] * cs - p[4] * sn, p[3] * sn + p[4] * cs, p[5], p[6]);
+    }
+  }
+  if (opened) {
+    // kıvılcımlar
+    const st = t - 0.6;
+    if (st > 0 && st < 3.5) for (const s of sparks)
+      plot(s[0] + s[3] * st, s[1] + s[4] * st - 1.2 * st * st, s[2] + s[5] * st, 0, 0, -1, 6);
+    // el yükselir, sonra sallanır
+    const g = ease((t - 1.5) / 1.6), lift = (BOT - 3) + g * (1.1 - (BOT - 3));
+    if (g > 0) {
+      const w = t > 3.1 ? Math.sin((t - 3.1) * 7) * 0.12 * Math.max(0.3, 1 - (t - 3.1) / 3) : 0, cw2 = Math.cos(w), sw = Math.sin(w);
+      for (const p of HAND) {
+        const y = p[1] + lift; if (y < BOT + 0.05) continue;
+        const x = p[0] * cw2 - p[1] * sw * 0.3;
+        plot(x, y, p[2], p[3] * cw2 - p[4] * sw, p[4] * cw2 + p[3] * sw, p[5], p[6]);
+      }
+    }
+  }
+
+  // çiz
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.textBaseline = 'top';
+  for (const s of stars) { // yıldızlar
+    const a = (Math.sin(T * 1.5 + s[2]) + 1) / 2;
+    if (a > 0.3) { ctx.fillStyle = `rgba(255,255,255,${a * 0.7})`; ctx.fillText(a > 0.9 ? '*' : '.', s[0] * cw, s[1] * ch); }
+  }
+  for (let r = 0, i = 0; r < rows; r++) for (let c = 0; c < cols; c++, i++) {
+    const m = mb[i]; if (m < 0) continue;
+    const l = lb[i];
+    ctx.fillStyle = PAL[m][l];
+    ctx.fillText(m === 6 ? '*+.'[i % 3] : RAMP[(l * (RAMP.length - 1) / (LV - 1)) | 0], c * cw, r * ch);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
